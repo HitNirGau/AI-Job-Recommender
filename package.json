@@ -1,0 +1,15 @@
+{
+  "name": "ai-resume-matcher-root",
+  "version": "1.0.0",
+  "description": "AI-Powered Resume Matcher & Intelligent Job Recommendation System Root",
+  "scripts": {
+    "install:all": "npm install --prefix client && npm install --prefix server && pip3 install -r nlp-service/requirements.txt",
+    "server": "npm run dev --prefix server",
+    "client": "npm run dev --prefix client",
+    "nlp": "./nlp-service/venv/bin/uvicorn nlp-service.app:app --host 127.0.0.1 --port 8000 --reload",
+    "dev": "concurrently \"npm run server\" \"npm run client\" \"npm run nlp\""
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  }
+}
