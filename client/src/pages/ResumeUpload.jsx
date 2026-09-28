@@ -19,6 +19,7 @@ const ResumeUpload = () => {
   const [uploading, setUploading] = useState(false);
   const [resumeData, setResumeData] = useState(null);
   const [error, setError] = useState('');
+  const [notification, setNotification] = useState('');
   const [dragActive, setDragActive] = useState(false);
   const [showGuide, setShowGuide] = useState(() => {
     return localStorage.getItem('hide_resume_guide') !== 'true';
@@ -67,6 +68,7 @@ const ResumeUpload = () => {
 
   const validateAndSetFile = (file) => {
     setError('');
+    setNotification('');
     const ext = file.name.substring(file.name.lastIndexOf('.')).toLowerCase();
     if (ext !== '.pdf' && ext !== '.docx') {
       setError('Only PDF and DOCX file formats are supported.');
@@ -83,6 +85,7 @@ const ResumeUpload = () => {
     if (!file) return;
     setUploading(true);
     setError('');
+    setNotification('');
 
     const formData = new FormData();
     formData.append('resume', file);
@@ -95,6 +98,11 @@ const ResumeUpload = () => {
       });
       setResumeData(res.data.resume);
       setFile(null);
+      if (res.data.duplicate) {
+        setNotification('This resume is already uploaded and processed. No reprocessing was required.');
+      } else {
+        setNotification('New resume uploaded and processed successfully.');
+      }
     } catch (err) {
       setError(formatUserError(err, 'Failed to process resume. Please ensure your PDF or DOCX file is valid and try again.'));
     } finally {
@@ -103,10 +111,13 @@ const ResumeUpload = () => {
   };
 
   const handleDelete = async () => {
-    if (!window.confirm("Are you sure you want to delete your parsed resume?")) return;
+    if (!window.confirm("Are you sure you want to remove your current resume?")) return;
+    setError('');
+    setNotification('');
     try {
       await axios.delete('http://localhost:5002/api/resumes/delete');
       setResumeData(null);
+      setNotification('Resume deleted successfully.');
     } catch (err) {
       setError(formatUserError(err, 'Failed to delete resume. Please try again.'));
     }
@@ -172,6 +183,13 @@ const ResumeUpload = () => {
             <li><span className="text-indigo-600 dark:text-cyan-400 font-bold">Dynamic Profile Build:</span> Extracted skills, education, projects, and contact info will auto-populate your user settings.</li>
             <li><span className="text-indigo-600 dark:text-cyan-400 font-bold">Recommender Link:</span> Extracted details prioritize relevant job suggestions matching your exact domain.</li>
           </ul>
+        </div>
+      )}
+
+      {notification && (
+        <div className="p-4 rounded-2xl bg-indigo-500/10 border border-indigo-500/20 text-indigo-600 dark:text-cyan-400 text-sm font-semibold flex items-center justify-between">
+          <span>✓ {notification}</span>
+          <button onClick={() => setNotification('')} className="text-xs text-slate-400 hover:text-slate-600 cursor-pointer">✕</button>
         </div>
       )}
 

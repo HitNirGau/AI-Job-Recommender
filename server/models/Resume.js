@@ -7,6 +7,10 @@ const ResumeSchema = new mongoose.Schema({
     required: true,
     unique: true
   },
+  fileHash: {
+    type: String,
+    index: true
+  },
   fileName: {
     type: String,
     required: true

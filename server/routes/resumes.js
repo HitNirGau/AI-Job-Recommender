@@ -3,6 +3,7 @@ import multer from 'multer';
 import axios from 'axios';
 import fs from 'fs';
 import path from 'path';
+import crypto from 'crypto';
 import FormData from 'form-data';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import { v2 as cloudinary } from 'cloudinary';
@@ -55,6 +56,23 @@ const upload = multer({
   fileFilter,
   limits: { fileSize: 10 * 1024 * 1024 } // 10MB limit
 });
+
+// Helper function to calculate SHA-256 hash of file content
+function calculateFileHash(filePath) {
+  const fileBuffer = fs.readFileSync(filePath);
+  return crypto.createHash('sha256').update(fileBuffer).digest('hex');
+}
+
+// Helper function to safely cleanup temporary uploaded files from disk
+function cleanupTempFile(filePath) {
+  if (filePath && fs.existsSync(filePath)) {
+    try {
+      fs.unlinkSync(filePath);
+    } catch (err) {
+      console.error("Failed to delete temp file:", err.message);
+    }
+  }
+}
 
 // Helper function for dynamic AI resume analysis fallback
 function getDynamicFallbackInsights(rawText = '', parsedSkills = []) {
@@ -189,39 +207,34 @@ async function getGeminiInsights(rawText, parsedSkills = []) {
   return fallback;
 }
 
-// Helper function to delete old resume assets from Cloudinary or local disk
-async function deleteResumeAsset(resume) {
-  if (!resume) return;
+// Helper function to delete old resume assets from Cloudinary or local disk safely
+async function deleteResumeAsset(resumeOrAsset) {
+  if (!resumeOrAsset) return;
+
+  const cloudinaryId = resumeOrAsset.cloudinaryId;
+  const filePath = resumeOrAsset.filePath;
 
   // 1. Delete from Cloudinary if it exists
-  if (resume.cloudinaryId) {
+  if (cloudinaryId) {
     try {
-      console.log(`Deleting previous asset from Cloudinary: ${resume.cloudinaryId}`);
+      console.log(`Deleting previous asset from Cloudinary: ${cloudinaryId}`);
       
-      // Configure dynamically on-demand
       cloudinary.config({
         cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
         api_key: process.env.CLOUDINARY_API_KEY,
         api_secret: process.env.CLOUDINARY_API_SECRET
       });
 
-      await cloudinary.uploader.destroy(resume.cloudinaryId, { resource_type: 'raw' });
+      await cloudinary.uploader.destroy(cloudinaryId, { resource_type: 'raw' });
     } catch (err) {
-      console.error("Failed to delete asset from Cloudinary:", err);
+      console.error("Failed to delete asset from Cloudinary:", err.message);
     }
   }
 
   // 2. Delete from local disk if it exists
-  if (resume.filePath && resume.filePath.startsWith('/uploads/')) {
-    const localPath = resume.filePath.substring(1);
-    if (fs.existsSync(localPath)) {
-      try {
-        console.log(`Deleting previous local asset: ${localPath}`);
-        fs.unlinkSync(localPath);
-      } catch (err) {
-        console.error("Failed to delete local asset:", err);
-      }
-    }
+  if (filePath && filePath.startsWith('/uploads/')) {
+    const localPath = filePath.substring(1);
+    cleanupTempFile(localPath);
   }
 }
 
@@ -235,9 +248,32 @@ router.post('/upload', auth, upload.single('resume'), async (req, res) => {
 
   const filePath = req.file.path;
   const nlpServiceUrl = process.env.NLP_SERVICE_URL || 'http://127.0.0.1:8000';
+  let newCloudinaryId = null;
 
   try {
-    // 1. Call Python NLP Service
+    // 1. Calculate SHA-256 hash of the actual file contents BEFORE any external API calls
+    const fileHash = calculateFileHash(filePath);
+
+    // 2. Retrieve existing resume document for the authenticated user
+    const existingResume = await Resume.findOne({ userId: req.user.id });
+
+    // 3. Duplicate Check: Skip FastAPI, Gemini, and Cloudinary if file hash is identical
+    if (existingResume && existingResume.fileHash === fileHash) {
+      console.log(`[Resume Upload] Duplicate resume detected (hash: ${fileHash.substring(0, 10)}...). Skipping reprocessing.`);
+      return res.json({
+        success: true,
+        duplicate: true,
+        msg: 'This resume has already been uploaded and processed. No reprocessing was required.',
+        message: 'This resume has already been uploaded and processed. No reprocessing was required.',
+        resume: existingResume
+      });
+    }
+
+    // Save old asset pointers to safely delete ONLY AFTER successful database update
+    const oldCloudinaryId = existingResume?.cloudinaryId;
+    const oldFilePath = existingResume?.filePath;
+
+    // 4. Send file to Python NLP Service
     const form = new FormData();
     form.append('file', fs.createReadStream(filePath));
 
@@ -250,13 +286,11 @@ router.post('/upload', auth, upload.single('resume'), async (req, res) => {
 
     const parsedDataResult = nlpResponse.data;
 
-    // 2. Query Gemini API for AI suggestions and summary
+    // 5. Query Gemini API for AI suggestions and summary
     const extractedSkillsList = parsedDataResult.parsed_data?.skills || [];
     const geminiData = await getGeminiInsights(parsedDataResult.text, extractedSkillsList);
 
-    // 3. Save to MongoDB based on dynamic storage strategy
-    let resume = await Resume.findOne({ userId: req.user.id });
-
+    // 6. Dynamic Storage processing
     const storageType = process.env.RESUME_STORAGE_TYPE || 'local';
     let finalFilePath = `/${filePath}`;
     let cloudinaryId = undefined;
@@ -267,19 +301,12 @@ router.post('/upload', auth, upload.single('resume'), async (req, res) => {
       const fileBuffer = fs.readFileSync(filePath);
       fileData = fileBuffer.toString('base64');
       fileMimeType = req.file.mimetype;
-      finalFilePath = '/api/resumes/download'; // Virtual download path
-
-      try {
-        fs.unlinkSync(filePath);
-      } catch (err) {
-        console.error("Failed to delete temp file:", err);
-      }
+      finalFilePath = '/api/resumes/download';
     } else if (storageType === 'cloudinary') {
       if (!process.env.CLOUDINARY_CLOUD_NAME || !process.env.CLOUDINARY_API_KEY || !process.env.CLOUDINARY_API_SECRET) {
         throw new Error('Cloudinary credentials are not configured in environment variables');
       }
 
-      // Configure dynamically on-demand
       cloudinary.config({
         cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
         api_key: process.env.CLOUDINARY_API_KEY,
@@ -293,16 +320,12 @@ router.post('/upload', auth, upload.single('resume'), async (req, res) => {
 
       finalFilePath = uploadResult.secure_url;
       cloudinaryId = uploadResult.public_id;
-
-      try {
-        fs.unlinkSync(filePath);
-      } catch (err) {
-        console.error("Failed to delete temp file:", err);
-      }
+      newCloudinaryId = cloudinaryId; // track newly created asset for safety rollback if DB update fails
     }
 
     const resumeData = {
       userId: req.user.id,
+      fileHash,
       fileName: req.file.originalname,
       filePath: finalFilePath,
       cloudinaryId,
@@ -316,22 +339,20 @@ router.post('/upload', auth, upload.single('resume'), async (req, res) => {
       suggestions: geminiData.suggestions
     };
 
-    if (resume) {
-      // Overwrite previous file by deleting existing assets first
-      await deleteResumeAsset(resume);
+    // 7. Update MongoDB (maintain ONE active Resume document per user)
+    const updatedResume = await Resume.findOneAndUpdate(
+      { userId: req.user.id },
+      { $set: resumeData },
+      { new: true, upsert: true }
+    );
 
-      resume = await Resume.findOneAndUpdate(
-        { userId: req.user.id },
-        { $set: resumeData },
-        { new: true }
-      );
-    } else {
-      resume = new Resume(resumeData);
-      await resume.save();
+    // 8. Delete OLD Cloudinary/disk asset ONLY AFTER new upload and database update succeed
+    if (existingResume) {
+      await deleteResumeAsset({ cloudinaryId: oldCloudinaryId, filePath: oldFilePath });
     }
 
-    // 4. Update the User profile skills if skills are parsed
-    const extractedSkills = parsedDataResult.parsed_data.skills || [];
+    // 9. Update User profile skills
+    const extractedSkills = parsedDataResult.parsed_data?.skills || [];
     if (extractedSkills.length > 0) {
       await User.findByIdAndUpdate(req.user.id, {
         $addToSet: { skills: { $each: extractedSkills } }
@@ -339,12 +360,22 @@ router.post('/upload', auth, upload.single('resume'), async (req, res) => {
     }
 
     res.json({
-      msg: 'Resume uploaded and parsed successfully',
-      resume
+      success: true,
+      duplicate: false,
+      msg: 'New resume uploaded and processed successfully.',
+      message: 'New resume uploaded and processed successfully.',
+      resume: updatedResume
     });
   } catch (err) {
     console.error("Upload/Parsing Error:", err.message);
+    // Cleanup newly created Cloudinary asset if DB update fails
+    if (newCloudinaryId) {
+      await deleteResumeAsset({ cloudinaryId: newCloudinaryId });
+    }
     res.status(500).json({ error: 'Unable to process resume document. Please verify your PDF or DOCX file and try again.' });
+  } finally {
+    // 10. Always clean up temporary local uploaded file from server disk
+    cleanupTempFile(filePath);
   }
 });
 
@@ -423,25 +454,30 @@ router.get('/download', auth, async (req, res) => {
   }
 });
 
-// @route    DELETE api/resumes/delete
-// @desc     Delete current user's resume
-// @access   Private
-router.delete('/delete', auth, async (req, res) => {
+// Helper for resume deletion logic
+const handleDeleteResume = async (req, res) => {
   try {
     const resume = await Resume.findOne({ userId: req.user.id });
     if (!resume) {
-      return res.status(404).json({ msg: 'No resume found to delete' });
+      return res.status(404).json({ msg: 'No resume found to delete', error: 'No resume found to delete' });
     }
 
     // Delete associated assets (local file or Cloudinary)
     await deleteResumeAsset(resume);
 
     await Resume.deleteOne({ userId: req.user.id });
-    res.json({ msg: 'Resume deleted successfully' });
+    res.json({ success: true, msg: 'Resume deleted successfully', message: 'Resume deleted successfully' });
   } catch (err) {
-    console.error(err.message);
-    res.status(500).send('Server error');
+    console.error("Delete resume error:", err.message);
+    res.status(500).json({ error: 'Failed to delete resume. Please try again.' });
   }
-});
+};
+
+// @route    DELETE api/resumes AND DELETE api/resumes/delete
+// @desc     Delete current user's resume
+// @access   Private
+router.delete('/', auth, handleDeleteResume);
+router.delete('/delete', auth, handleDeleteResume);
 
 export default router;
+
